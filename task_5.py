@@ -1,19 +1,21 @@
-import tensorflow as tf
+from tensorflow import keras
 from keras.layers import Dense, Input
 from keras.layers import Conv2D, Flatten, Lambda
 from keras.layers import Reshape, Conv2DTranspose
 from keras.models import Model
 from keras.losses import mse
-from keras.utils import plot_model
 from keras import backend as K
 from keras.datasets import fashion_mnist
+from keras.utils import to_categorical
 
 import numpy as np
 import matplotlib.pyplot as plt
 import os
+import time
+import sys
 
 
-# reparameterization trick
+# reparameterization trick from https://keras.io/examples/variational_autoencoder/
 # instead of sampling from Q(z|X), sample eps = N(0,I)
 # then z = z_mean + sqrt(var)*eps
 def sampling(args):
@@ -34,76 +36,111 @@ def sampling(args):
     return z_mean + K.exp(0.5 * z_log_var) * epsilon
 
 
-
-def plot_results(models,
-                 data,
-                 batch_size=128,
-                 model_name="vae_mnist"):
-    """Plots labels and MNIST digits as function of 2-dim latent vector
-
-    # Arguments
-        models (tuple): encoder and decoder models
-        data (tuple): test data and label
-        batch_size (int): prediction batch size
-        model_name (string): which model is using this function
-    """
-
-    encoder, decoder = models
-    x_test, y_test = data
-    os.makedirs(model_name, exist_ok=True)
-
-    filename = os.path.join(model_name, "vae_mean.png")
-    # display a 2D plot of the digit classes in the latent space
-    z_mean, _, _ = encoder.predict(x_test,
-                                   batch_size=batch_size)
-    plt.figure(figsize=(12, 10))
-    plt.scatter(z_mean[:, 0], z_mean[:, 1], c=y_test)
-    plt.colorbar()
-    plt.xlabel("z[0]")
-    plt.ylabel("z[1]")
-    plt.savefig(filename)
-    plt.show()
-
-    filename = os.path.join(model_name, "digits_over_latent.png")
-    # display a 30x30 2D manifold of digits
-    n = 30
-    digit_size = 28
-    figure = np.zeros((digit_size * n, digit_size * n))
-    # linearly spaced coordinates corresponding to the 2D plot
-    # of digit classes in the latent space
-    grid_x = np.linspace(-4, 4, n)
-    grid_y = np.linspace(-4, 4, n)[::-1]
-
-    for i, yi in enumerate(grid_y):
-        for j, xi in enumerate(grid_x):
-            z_sample = np.array([[xi, yi]])
-            x_decoded = decoder.predict(z_sample)
-            digit = x_decoded[0].reshape(digit_size, digit_size)
-            figure[i * digit_size: (i + 1) * digit_size,
-                   j * digit_size: (j + 1) * digit_size] = digit
-
-    plt.figure(figsize=(10, 10))
-    start_range = digit_size // 2
-    end_range = n * digit_size + start_range + 1
-    pixel_range = np.arange(start_range, end_range, digit_size)
-    sample_range_x = np.round(grid_x, 1)
-    sample_range_y = np.round(grid_y, 1)
-    plt.xticks(pixel_range, sample_range_x)
-    plt.yticks(pixel_range, sample_range_y)
-    plt.xlabel("z[0]")
-    plt.ylabel("z[1]")
-    plt.imshow(figure, cmap='Greys_r')
-    plt.savefig(filename)
-    plt.show()
-
-
+# normalization function
 def normalization(matrix, max_val, min_val):
     new_matrix = np.array([((image - min_val) / (max_val - min_val)) for image in matrix])
     return new_matrix
 
 
-# MNIST dataset
+# from https://stackoverflow.com/questions/43178668/record-the-computation-time-for-each-epoch-in-keras-during-model-fit
+# Class which enables to store the execution time per epoch
+class TimeHistory(keras.callbacks.Callback):
+    def on_train_begin(self, logs={}):
+        self.times = []
+
+    def on_epoch_begin(self, batch, logs={}):
+        self.epoch_time_start = time.time()
+
+    def on_epoch_end(self, batch, logs={}):
+        self.times.append(time.time() - self.epoch_time_start)
+
+
+def acc_time(time_stamps):
+    # accumulate all single time values
+    accumulated_time = []
+    acc_time = 0
+    for time in time_stamps:
+        acc_time += time
+        accumulated_time.append(acc_time)
+    # print(accumulated_time)
+    return accumulated_time
+
+
+# function that compiles, fits and plots
+def run_vae(model, x_train, x_test, decoder, latent_dim):
+    # compile the given model architecture
+    model.compile(optimizer='sgd')
+
+    # call class for taking time stamps for each epoch
+    time_callback_train = TimeHistory()
+
+    # fit the model (train the network) and save metrics in variable history
+    history = model.fit(x_train, epochs=50, batch_size=200, validation_data=(x_test, None),
+                        callbacks=[time_callback_train])
+
+    # store time stamps per epoch in variable
+    times_train = time_callback_train.times
+    print()
+    print("Reported times per epoch: \n ", times_train)
+
+    accumulated_time = acc_time(times_train)
+
+    # Evaluate model using testing dataset
+    test_start_time = time.time()
+    test_loss = model.evaluate(x_test, batch_size=200, verbose=2)
+    print()
+    print()
+    print('Test Loss: {}'.format(test_loss))
+    test_end_time = time.time() - test_start_time
+    print('Time for Testing Data: ', test_end_time)
+
+    # Plot training loss values vs epochs
+    plt.plot(history.history['loss'])
+    plt.title('Model Loss vs. Epochs')
+    plt.ylabel('Loss')
+    plt.xlabel('Epoch')
+    plt.legend(['Train', 'Test'], loc='upper left')
+    plt.savefig('vae_loss_epoch.png')
+    plt.show()
+
+    # Plot training time vs epochs
+    plt.plot(accumulated_time, history.history['loss'])
+    plt.title('Model Loss vs. Time')
+    plt.ylabel('Loss')
+    plt.xlabel('Time in seconds')
+    plt.legend(['Train'], loc='upper left')
+    plt.savefig('vae_time_epoch.png')
+    plt.show()
+
+    # Generate a set of clothes by randomly choosing 10 latent vectors and presenting the resulting images
+    random_latents = []
+    for i in range(10):
+        random_latent = np.random.normal(0, 1, latent_dim)
+        decoded_img = decoder.predict(np.array([random_latent]))
+        decoded_img_reshape = np.reshape(decoded_img, (28, 28))
+        random_latents.append(decoded_img_reshape)
+
+    for i in range(10):
+        plt.subplot(5, 5, i + 1)
+        plt.xticks([])
+        plt.yticks([])
+        plt.gray()
+        plt.grid(False)
+        plt.imshow(random_latents[i])
+    plt.savefig('latent_vec_img.png')
+    plt.show()
+
+    return history
+
+
+
+# import fashion MNIST dataset
 (x_train, y_train), (x_test, y_test) = fashion_mnist.load_data()
+y_train_cat = to_categorical(y_train)
+y_test_cat = to_categorical(y_test)
+
+class_names = ['T-shirt/top', 'Trouser', 'Pullover', 'Dress', 'Coat',
+               'Sandal', 'Shirt', 'Sneaker', 'Bag', 'Ankle boot']
 
 # Get min, and max value from training data set using all 60,000 samples
 max_val = x_train.max()
@@ -114,99 +151,155 @@ min_val = x_train.min()
 x_train_scaled = normalization(x_train, max_val, min_val)
 x_test_scaled = normalization(x_test, max_val, min_val)
 
-image_size = x_train.shape[1]
-x_train = np.reshape(x_train, [-1, image_size, image_size, 1])
-x_test = np.reshape(x_test, [-1, image_size, image_size, 1])
-x_train = x_train.astype('float32') / 255
-x_test = x_test.astype('float32') / 255
-
-print(image_size)
-print(x_train.shape, x_test.shape)
+# reshape data
+image_size = x_train_scaled.shape[1]
+reshaped_x_train_scaled = np.reshape(x_train_scaled, [-1, image_size, image_size, 1])
+reshaped_x_test_scaled = np.reshape(x_test_scaled, [-1, image_size, image_size, 1])
 
 
-# network parameters
-input_shape = (image_size, image_size, 1)
-batch_size = 200
-kernel_size = 3
-filters = 16
-latent_dim = 5
-epochs = 50
+#######################################################
+# Variational Autoencoder #1
+#######################################################
+def vae_1(x_train, x_test):
+    # network parameters
+    input_shape = (image_size, image_size, 1)
+    kernel_size = 3
+    filters = 16
+    latent_dim = 10
 
-# VAE model = encoder + decoder
-# build encoder model
-inputs = Input(shape=input_shape, name='encoder_input')
-x = inputs
-for i in range(2):
-    filters *= 2
-    x = Conv2D(filters=filters,
-               kernel_size=kernel_size,
-               activation='relu',
-               strides=2,
-               padding='same')(x)
+    # build encoder
+    inputs = Input(shape=input_shape, name='encoder_input')
+    x = inputs
+    for i in range(2):
+        filters *= 2
+        x = Conv2D(filters=filters, kernel_size=kernel_size, activation='relu', strides=2, padding='same')(x)
 
-# shape info needed to build decoder model
-shape = K.int_shape(x)
-print(shape)
+    # shape info needed to build decoder model
+    shape = K.int_shape(x)
 
-# generate latent vector Q(z|X)
-x = Flatten()(x)
-x = Dense(16, activation='relu')(x)
-z_mean = Dense(latent_dim, name='z_mean')(x)
-z_log_var = Dense(latent_dim, name='z_log_var')(x)
+    # generate latent vector Q(z|X)
+    x = Flatten()(x)
+    x = Dense(16, activation='relu')(x)
+    z_mean = Dense(latent_dim, name='z_mean')(x)
+    z_log_var = Dense(latent_dim, name='z_log_var')(x)
 
-# use reparameterization trick to push the sampling out as input
-# note that "output_shape" isn't necessary with the TensorFlow backend
-z = Lambda(sampling, output_shape=(latent_dim,), name='z')([z_mean, z_log_var])
+    # use reparameterization trick to push the sampling out as input
+    z = Lambda(sampling, output_shape=(latent_dim,), name='z')([z_mean, z_log_var])
 
-# instantiate encoder model
-encoder = Model(inputs, [z_mean, z_log_var, z], name='encoder')
-encoder.summary()
-plot_model(encoder, to_file='vae_cnn_encoder.png', show_shapes=True)
+    # instantiate encoder
+    encoder = Model(inputs, [z_mean, z_log_var, z], name='encoder')
+    print(encoder.summary())
 
-# build decoder model
-latent_inputs = Input(shape=(latent_dim,), name='z_sampling')
-x = Dense(shape[1] * shape[2] * shape[3], activation='relu')(latent_inputs)
-x = Reshape((shape[1], shape[2], shape[3]))(x)
+    # build decoder
+    latent_inputs = Input(shape=(latent_dim,), name='z_sampling')
+    x = Dense(shape[1] * shape[2] * shape[3], activation='relu')(latent_inputs)
+    x = Reshape((shape[1], shape[2], shape[3]))(x)
 
-for i in range(2):
-    x = Conv2DTranspose(filters=filters,
-                        kernel_size=kernel_size,
-                        activation='relu',
-                        strides=2,
-                        padding='same')(x)
-    filters //= 2
+    for i in range(2):
+        x = Conv2DTranspose(filters=filters, kernel_size=kernel_size, activation='relu', strides=2, padding='same')(x)
+        filters //= 2
 
-outputs = Conv2DTranspose(filters=1,
-                          kernel_size=kernel_size,
-                          activation='sigmoid',
-                          padding='same',
-                          name='decoder_output')(x)
+    outputs = Conv2DTranspose(filters=1, kernel_size=kernel_size, activation='sigmoid', padding='same', name='decoder_output')(x)
 
-# instantiate decoder model
-decoder = Model(latent_inputs, outputs, name='decoder')
-decoder.summary()
-plot_model(decoder, to_file='vae_cnn_decoder.png', show_shapes=True)
+    # instantiate decoder
+    decoder = Model(latent_inputs, outputs, name='decoder')
+    print(decoder.summary())
+
+    # instantiate VAE
+    outputs = decoder(encoder(inputs)[2])
+    vae = Model(inputs, outputs, name='vae')
+    print(vae.summary())
+
+    # set loss
+    reconstruction_loss = mse(K.flatten(inputs), K.flatten(outputs))
+    reconstruction_loss *= image_size * image_size
+    kl_loss = 1 + z_log_var - K.square(z_mean) - K.exp(z_log_var)
+    kl_loss = K.sum(kl_loss, axis=-1)
+    kl_loss *= -0.5
+    vae_loss = K.mean(reconstruction_loss + kl_loss)
+    vae.add_loss(vae_loss)
+
+    run_vae(vae, x_train, x_test, decoder, latent_dim)
 
 
 
-# instantiate VAE model
-outputs = decoder(encoder(inputs)[2])
-vae = Model(inputs, outputs, name='vae')
+#######################################################
+# Variational Autoencoder #2
+#######################################################
+def vae_2(x_train, x_test):
+    # network parameters
+    input_shape = (image_size, image_size, 1)
+    kernel_size = 3
+    filters = 16
+    latent_dim = 32
+
+    # VAE model = encoder + decoder
+    # build encoder
+    inputs = Input(shape=input_shape, name='encoder_input')
+    x = inputs
+    for i in range(2):
+        filters *= 2
+        x = Conv2D(filters=filters, kernel_size=kernel_size, activation='relu', strides=2, padding='same')(x)
+
+    # shape info needed to build decoder
+    shape = K.int_shape(x)
+
+    # generate latent vector Q(z|X)
+    x = Flatten()(x)
+    x = Dense(16, activation='relu')(x)
+    z_mean = Dense(latent_dim, name='z_mean')(x)
+    z_log_var = Dense(latent_dim, name='z_log_var')(x)
+
+    # use reparameterization trick to push the sampling out as input
+    z = Lambda(sampling, output_shape=(latent_dim,), name='z')([z_mean, z_log_var])
+
+    # instantiate encoder
+    encoder = Model(inputs, [z_mean, z_log_var, z], name='encoder')
+    print(encoder.summary())
+
+    # build decoder
+    latent_inputs = Input(shape=(latent_dim,), name='z_sampling')
+    x = Dense(shape[1] * shape[2] * shape[3], activation='relu')(latent_inputs)
+    x = Reshape((shape[1], shape[2], shape[3]))(x)
+
+    for i in range(2):
+        x = Conv2DTranspose(filters=filters, kernel_size=kernel_size, activation='relu', strides=2, padding='same')(x)
+        filters //= 2
+
+    outputs = Conv2DTranspose(filters=1, kernel_size=kernel_size, activation='sigmoid', padding='same', name='decoder_output')(x)
+
+    # instantiate decoder
+    decoder = Model(latent_inputs, outputs, name='decoder')
+    print(decoder.summary())
+
+    # instantiate VAE
+    outputs = decoder(encoder(inputs)[2])
+    vae = Model(inputs, outputs, name='vae')
+    print(vae.summary())
+
+    # set loss
+    reconstruction_loss = mse(K.flatten(inputs), K.flatten(outputs))
+    reconstruction_loss *= image_size * image_size
+    kl_loss = 1 + z_log_var - K.square(z_mean) - K.exp(z_log_var)
+    kl_loss = K.sum(kl_loss, axis=-1)
+    kl_loss *= -0.5
+    vae_loss = K.mean(reconstruction_loss + kl_loss)
+    vae.add_loss(vae_loss)
+
+    run_vae(vae, x_train, x_test, decoder, latent_dim)
+
+# Driver code main()
+def main(argv=None):
+    if argv[1] == "task5_vae1":
+        # VAE 1
+        vae_1(reshaped_x_train_scaled, reshaped_x_test_scaled)
+
+    elif argv[1] == "task5_vae2":
+        # VAE 2
+        vae_2(reshaped_x_train_scaled, reshaped_x_test_scaled)
 
 
-reconstruction_loss = mse(K.flatten(inputs), K.flatten(outputs))
-reconstruction_loss *= image_size * image_size
-kl_loss = 1 + z_log_var - K.square(z_mean) - K.exp(z_log_var)
-kl_loss = K.sum(kl_loss, axis=-1)
-kl_loss *= -0.5
-vae_loss = K.mean(reconstruction_loss + kl_loss)
-vae.add_loss(vae_loss)
-vae.compile(optimizer='adam', metrics=['accuracy'])
-vae.summary()
-plot_model(vae, to_file='vae_cnn.png', show_shapes=True)
+if __name__ == '__main__':
+    main(sys.argv)
 
 
-vae.fit(x_train,
-                epochs=epochs,
-                batch_size=batch_size,
-                validation_data=(x_test, None))
